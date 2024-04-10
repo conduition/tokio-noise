@@ -1,10 +1,3 @@
-# tokio-noise
-
-A Noise protocol encryption layer on top of tokio streams.
-
-## Usage
-
-```rust
 use tokio::net::{TcpListener, TcpStream};
 use tokio_noise::{NoiseError, NoiseTcpStream};
 
@@ -38,4 +31,3 @@ async fn main() -> Result<(), NoiseError> {
 
     Ok(())
 }
-```
