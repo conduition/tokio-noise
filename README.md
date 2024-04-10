@@ -2,6 +2,8 @@
 
 A Noise protocol encryption layer on top of tokio streams.
 
+This library is [sponsored by DLC.Link](https://www.dlc.link/).
+
 ## Usage
 
 ```rust
