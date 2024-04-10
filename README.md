@@ -1,2 +1,3 @@
 # tokio-noise
-Noise protocol wrappers on top of tokio streams.
+
+A Noise protocol encryption layer on top of tokio streams.
