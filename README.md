@@ -1,6 +1,6 @@
 # tokio-noise
 
-A Noise protocol encryption layer on top of tokio streams.
+An authenticated encryption layer on top of [tokio](https://tokio.rs) streams, driven by the [Noise Protocol Framework](https://noiseprotocol.org/).
 
 This library is [sponsored by DLC.Link](https://www.dlc.link/).
 

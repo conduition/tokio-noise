@@ -16,12 +16,14 @@ use crate::errors::NoiseError;
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA512";
 
-pub const NOISE_TAG_SIZE: usize = 16;
-pub const NOISE_NONCE_SIZE: usize = 8;
-pub const CIPHERTEXT_PACKET_SIZE: usize = 2048;
-pub const PLAINTEXT_PACKET_SIZE: usize = CIPHERTEXT_PACKET_SIZE - NOISE_TAG_SIZE - NOISE_NONCE_SIZE;
-pub const MIN_CIPHERTEXT_PACKET_SIZE: usize = NOISE_NONCE_SIZE + NOISE_TAG_SIZE;
+const NOISE_TAG_SIZE: usize = 16;
+const NOISE_NONCE_SIZE: usize = 8;
+const CIPHERTEXT_PACKET_SIZE: usize = 2048;
+const PLAINTEXT_PACKET_SIZE: usize = CIPHERTEXT_PACKET_SIZE - NOISE_TAG_SIZE - NOISE_NONCE_SIZE;
+const MIN_CIPHERTEXT_PACKET_SIZE: usize = NOISE_NONCE_SIZE + NOISE_TAG_SIZE;
 
+/// Represents a [`tokio::io::TcpStream`] wrapped with a layer of [Noise](https://noiseprotocol.org/)
+/// encryption applied on top.
 pub struct NoiseTcpStream {
     name: String,
     tcp: TcpStream,
@@ -30,6 +32,8 @@ pub struct NoiseTcpStream {
 }
 
 impl NoiseTcpStream {
+    /// Instantiate a new encrypted stream using the given noise transport state machine.
+    /// The name can be any arbitrary identifier for the stream - it is only used for logging.
     pub fn new(name: String, socket: TcpStream, noise: snow::TransportState) -> NoiseTcpStream {
         NoiseTcpStream {
             name,
@@ -39,6 +43,11 @@ impl NoiseTcpStream {
         }
     }
 
+    /// Conduct an `NNpsk0` handshake as the Noise initiator.
+    ///
+    /// This presumes the initiator and responder both have access to the same pre-shared key (PSK),
+    /// which is used for authentication and encryption of the proceeding handshake, which establishes
+    /// a session key with perfect-forward secrecy.
     pub async fn handshake_initiator_psk0(
         mut socket: TcpStream,
         psk: &[u8],
@@ -77,6 +86,11 @@ impl NoiseTcpStream {
         Ok(chan)
     }
 
+    /// Conduct an `NNpsk0` handshake as the Noise responder.
+    ///
+    /// This presumes the initiator and responder both have access to the same pre-shared key (PSK),
+    /// which is used for authentication and encryption of the proceeding handshake, which establishes
+    /// a session key with perfect-forward secrecy.
     pub async fn handshake_responder_psk0(
         mut socket: TcpStream,
         psk: &[u8],
@@ -115,13 +129,13 @@ impl NoiseTcpStream {
         Ok(chan)
     }
 
-    // Send some arbitrary data over the noise-encrypted channel.
+    /// Send some arbitrary data over the noise-encrypted channel.
     pub async fn send(&mut self, cleartext: &[u8]) -> Result<(), NoiseError> {
         AsyncWriteExt::write_all(self, cleartext).await?;
         Ok(())
     }
 
-    // Receive some arbitrary data over the noise-encrypted channel.
+    /// Receive some arbitrary data over the noise-encrypted channel.
     pub async fn recv(&mut self, output: &mut [u8]) -> Result<usize, NoiseError> {
         Ok(AsyncReadExt::read(self, output).await?)
     }
