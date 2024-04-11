@@ -123,23 +123,7 @@ impl NoiseTcpStream {
 
     // Receive some arbitrary data over the noise-encrypted channel.
     pub async fn recv(&mut self, output: &mut [u8]) -> Result<usize, NoiseError> {
-        let mut total_read = 0;
-
-        loop {
-            let n = AsyncReadExt::read(self, &mut output[total_read..]).await?;
-            total_read += n;
-
-            if total_read > output.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "read more data than buffer len should allow",
-                ))?;
-            }
-
-            if n == 0 || total_read == output.len() {
-                return Ok(total_read);
-            }
-        }
+        Ok(AsyncReadExt::read(self, output).await?)
     }
 
     /// Wraps [`TcpStream::nodelay`].
@@ -280,82 +264,99 @@ impl AsyncRead for NoiseTcpStream {
         cx: &mut Context<'_>,
         output_buf: &mut io::ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        while let Some(byte) = self.read_overflow_buf.pop_front() {
-            output_buf.put_u8(byte);
-            if output_buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
-            }
-        }
-
-        let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
-        let mut ciphertext_buf = io::ReadBuf::new(&mut ciphertext);
-
-        match AsyncRead::poll_read(Pin::new(&mut self.tcp), cx, &mut ciphertext_buf) {
-            Poll::Ready(Ok(())) => {}
-            other => return other,
-        };
-
-        let filled = ciphertext_buf.filled();
-        if filled.len() == 0 {
-            return Poll::Ready(Ok(()));
-        } else if filled.len() < MIN_CIPHERTEXT_PACKET_SIZE {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "received message is too short to hold noise message",
-            )));
-        }
-
-        let mut cleartext = [0u8; PLAINTEXT_PACKET_SIZE];
-        let mut our_nonce = self.noise.receiving_nonce();
-        let their_nonce = read_u64(&filled[..NOISE_NONCE_SIZE]);
-
-        // Sometimes the remote side will encounter a problem sending, and for safety
-        // they cannot reuse nonces. So they specify which nonce they used in each
-        // message. As long as the nonce claimed by the remote side is no lower than
-        // the nonce in our local state, it is safe to update our receiving nonce to match.
-        if their_nonce > our_nonce {
-            our_nonce = their_nonce;
-            self.noise.set_receiving_nonce(their_nonce);
-        }
-
-        match self
-            .noise
-            .read_message(&filled[NOISE_NONCE_SIZE..], &mut cleartext)
-        {
-            Ok(read_n) => {
-                trace!(
-                    "[{}] poll_read OK; ciphertext={} plaintext={} nonce={}",
-                    self.name,
-                    filled.len(),
-                    read_n,
-                    our_nonce
-                );
-
-                if output_buf.remaining() >= read_n {
-                    output_buf.put_slice(&cleartext[..read_n]);
-                } else {
-                    output_buf.put_slice(&cleartext[..output_buf.remaining()]);
-                    self.read_overflow_buf
-                        .extend(&cleartext[output_buf.remaining()..read_n]);
+        let mut total_read = 0;
+        loop {
+            while let Some(byte) = self.read_overflow_buf.pop_front() {
+                output_buf.put_u8(byte);
+                if output_buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
                 }
             }
 
-            Err(e) => {
-                error!(
-                    "[{}] poll_read ERROR; ciphertext={} nonce={}; error message: {}",
-                    self.name,
-                    filled.len(),
-                    our_nonce,
-                    e
-                );
+            let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
+            let mut ciphertext_buf = io::ReadBuf::new(&mut ciphertext);
+
+            match AsyncRead::poll_read(Pin::new(&mut self.tcp), cx, &mut ciphertext_buf) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    // No data left to read from socket
+                    if total_read > 0 {
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+            };
+
+            let filled = ciphertext_buf.filled();
+
+            // No data left in socket.
+            if filled.len() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            // Invalid noise message.
+            if filled.len() < MIN_CIPHERTEXT_PACKET_SIZE {
                 return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    e.to_string(),
+                    io::ErrorKind::UnexpectedEof,
+                    "received message is too short to hold noise message",
                 )));
             }
-        };
 
-        Poll::Ready(Ok(()))
+            let mut cleartext = [0u8; PLAINTEXT_PACKET_SIZE];
+            let mut our_nonce = self.noise.receiving_nonce();
+            let their_nonce = read_u64(&filled[..NOISE_NONCE_SIZE]);
+
+            // Sometimes the remote side will encounter a problem sending, and for safety
+            // they cannot reuse nonces. So they specify which nonce they used in each
+            // message. As long as the nonce claimed by the remote side is no lower than
+            // the nonce in our local state, it is safe to update our receiving nonce to match.
+            if their_nonce > our_nonce {
+                our_nonce = their_nonce;
+                self.noise.set_receiving_nonce(their_nonce);
+            }
+
+            match self
+                .noise
+                .read_message(&filled[NOISE_NONCE_SIZE..], &mut cleartext)
+            {
+                Ok(read_n) => {
+                    trace!(
+                        "[{}] poll_read OK; ciphertext={} plaintext={} nonce={}",
+                        self.name,
+                        filled.len(),
+                        read_n,
+                        our_nonce
+                    );
+
+                    // No room left in output buffer. Fill it and return.
+                    if output_buf.remaining() <= read_n {
+                        output_buf.put_slice(&cleartext[..output_buf.remaining()]);
+                        self.read_overflow_buf
+                            .extend(&cleartext[output_buf.remaining()..read_n]);
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    output_buf.put_slice(&cleartext[..read_n]);
+                    total_read += read_n;
+                }
+
+                Err(e) => {
+                    error!(
+                        "[{}] poll_read ERROR; ciphertext={} nonce={}; error message: {}",
+                        self.name,
+                        filled.len(),
+                        our_nonce,
+                        e
+                    );
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )));
+                }
+            };
+        }
     }
 }
 
