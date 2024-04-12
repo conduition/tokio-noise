@@ -13,8 +13,7 @@ use tokio::{
 };
 
 use crate::errors::NoiseError;
-
-const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA512";
+use crate::handshakes::{Handshake, NNpsk0};
 
 const NOISE_TAG_SIZE: usize = 16;
 const NOISE_NONCE_SIZE: usize = 8;
@@ -43,47 +42,193 @@ impl NoiseTcpStream {
         }
     }
 
-    /// Conduct an `NNpsk0` handshake as the Noise initiator.
-    ///
-    /// This presumes the initiator and responder both have access to the same pre-shared key (PSK),
-    /// which is used for authentication and encryption of the proceeding handshake, which establishes
-    /// a session key with perfect-forward secrecy.
-    pub async fn handshake_initiator_psk0(
+    /// Conduct a Noise handshake over the given TCP socket as the initiator,
+    /// using a custom [`Handshake`] protocol.
+    pub async fn handshake_initiator(
         mut socket: TcpStream,
-        psk: &[u8],
+        mut handshake: impl Handshake,
     ) -> Result<NoiseTcpStream, NoiseError> {
-        let mut recv_cipher_buf = [0u8; 1024];
-        let mut recv_clear_buf = [0u8; 1024];
-        let mut send_buf = [0u8; 1024];
+        let mut recv_cipher_buf = [0u8; CIPHERTEXT_PACKET_SIZE];
+        let mut recv_clear_buf = [0u8; PLAINTEXT_PACKET_SIZE];
+        let mut send_buf = [0u8; CIPHERTEXT_PACKET_SIZE];
 
-        let mut initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
-            .psk(0, psk)
-            .build_initiator()?;
+        let mut initiator = handshake.new_builder().build_initiator()?;
 
-        // -> e
-        let wrote_n = initiator.write_message(&[], &mut send_buf)?;
+        // -> 1
+        let wrote_n = handshake.initiator_first_message(&mut initiator, &mut send_buf)?;
         socket.write_all(&send_buf[..wrote_n]).await?;
         debug!(
             "[initiator] sent initial {}-byte message to responder",
             wrote_n
         );
 
-        // <- e, ee
-        let read_n = socket.read(&mut recv_cipher_buf).await?;
-        initiator.read_message(&recv_cipher_buf[..read_n], &mut recv_clear_buf)?;
-        debug!(
-            "[initiator] received initial {}-byte reply from responder",
-            read_n
-        );
+        let mut read_overflow_buf = VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE);
 
-        let chan = NoiseTcpStream::new(
-            "initiator".to_string(),
-            socket,
-            initiator.into_transport_mode()?,
-        );
+        // <- 2
+        if !initiator.is_handshake_finished() {
+            let read_cipher_n = socket.read(&mut recv_cipher_buf).await?;
+            debug!(
+                "[initiator] received initial {}-byte reply from responder",
+                read_cipher_n
+            );
+
+            let read_clear_n =
+                initiator.read_message(&recv_cipher_buf[..read_cipher_n], &mut recv_clear_buf)?;
+            debug!(
+                "[initiator] decrypted initial {}-byte reply from responder",
+                read_cipher_n
+            );
+
+            // -> 3
+            if !initiator.is_handshake_finished() {
+                let wrote_n = handshake.initiator_second_message(
+                    &mut initiator,
+                    &recv_clear_buf[..read_clear_n],
+                    &mut send_buf,
+                )?;
+                socket.write_all(&send_buf[..wrote_n]).await?;
+                debug!(
+                    "[initiator] sent second {}-byte message to responder",
+                    wrote_n
+                );
+
+                // <- 4
+                if !initiator.is_handshake_finished() {
+                    let read_cipher_n = socket.read(&mut recv_cipher_buf).await?;
+                    debug!(
+                        "[initiator] received second {}-byte reply from responder",
+                        read_cipher_n
+                    );
+
+                    let read_clear_n = initiator
+                        .read_message(&recv_cipher_buf[..read_cipher_n], &mut recv_clear_buf)?;
+                    debug!(
+                        "[initiator] decrypted second {}-byte reply from responder",
+                        read_clear_n
+                    );
+
+                    // Dump any additional bytes read into the buffer so the caller will read
+                    // them first.
+                    read_overflow_buf.extend(&recv_clear_buf[..read_clear_n]);
+
+                    assert!(
+                        initiator.is_handshake_finished(),
+                        "handshake should always finish after 4 messages"
+                    );
+                }
+            } else {
+                read_overflow_buf.extend(&recv_clear_buf[..read_clear_n]);
+            }
+        }
+
+        let chan = NoiseTcpStream {
+            name: "initiator".to_string(),
+            tcp: socket,
+            noise: initiator.into_transport_mode()?,
+            read_overflow_buf,
+        };
 
         info!("[initiator] completed noise handshake");
         Ok(chan)
+    }
+
+    /// Conduct a Noise handshake over the given TCP socket as the responder,
+    /// using a custom [`Handshake`] protocol.
+    pub async fn handshake_responder(
+        mut socket: TcpStream,
+        mut handshake: impl Handshake,
+    ) -> Result<NoiseTcpStream, NoiseError> {
+        let mut recv_cipher_buf = [0u8; CIPHERTEXT_PACKET_SIZE];
+        let mut recv_clear_buf = [0u8; PLAINTEXT_PACKET_SIZE];
+        let mut send_buf = [0u8; CIPHERTEXT_PACKET_SIZE];
+
+        let mut responder = handshake.new_builder().build_responder()?;
+
+        // -> 1
+        let read_cipher_n = socket.read(&mut recv_cipher_buf).await?;
+        debug!(
+            "[responder] received initial {}-byte message from initiator",
+            read_cipher_n
+        );
+
+        let read_clear_n =
+            responder.read_message(&recv_cipher_buf[..read_cipher_n], &mut recv_clear_buf)?;
+        debug!(
+            "[responder] decrypted initial {}-byte message from initiator",
+            read_cipher_n
+        );
+
+        let mut read_overflow_buf = VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE);
+
+        // <- 2
+        if !responder.is_handshake_finished() {
+            let wrote_n = handshake.responder_first_message(
+                &mut responder,
+                &recv_clear_buf[..read_clear_n],
+                &mut send_buf,
+            )?;
+            socket.write_all(&send_buf[..wrote_n]).await?;
+            debug!(
+                "[responder] sent initial {}-byte reply to initiator",
+                wrote_n
+            );
+
+            // -> 3
+            if !responder.is_handshake_finished() {
+                let read_cipher_n = socket.read(&mut recv_cipher_buf).await?;
+                debug!(
+                    "[responder] received second {}-byte reply from initiator",
+                    read_cipher_n
+                );
+
+                let read_clear_n = responder
+                    .read_message(&recv_cipher_buf[..read_cipher_n], &mut recv_clear_buf)?;
+                debug!(
+                    "[responder] decrypted second {}-byte reply from initiator",
+                    read_clear_n
+                );
+
+                // <- 4
+                if !responder.is_handshake_finished() {
+                    let wrote_n = handshake.responder_second_message(
+                        &mut responder,
+                        &recv_clear_buf[..read_clear_n],
+                        &mut send_buf,
+                    )?;
+                    socket.write_all(&send_buf[..wrote_n]).await?;
+                    debug!(
+                        "[responder] sent second {}-byte message to initiator",
+                        wrote_n
+                    );
+                } else {
+                    read_overflow_buf.extend(&recv_clear_buf[..read_clear_n]);
+                }
+            }
+        } else {
+            read_overflow_buf.extend(&recv_clear_buf[..read_clear_n]);
+        }
+
+        let chan = NoiseTcpStream {
+            name: "responder".to_string(),
+            tcp: socket,
+            noise: responder.into_transport_mode()?,
+            read_overflow_buf,
+        };
+
+        info!("[responder] completed noise handshake");
+        Ok(chan)
+    }
+
+    /// Conduct an `NNpsk0` handshake as the Noise initiator.
+    ///
+    /// This presumes the initiator and responder both have access to the same pre-shared key (PSK),
+    /// which is used for authentication and encryption of the proceeding handshake, which establishes
+    /// a session key with perfect-forward secrecy.
+    pub async fn handshake_initiator_psk0(
+        socket: TcpStream,
+        psk: &[u8],
+    ) -> Result<NoiseTcpStream, NoiseError> {
+        NoiseTcpStream::handshake_initiator(socket, NNpsk0::new(psk)).await
     }
 
     /// Conduct an `NNpsk0` handshake as the Noise responder.
@@ -92,41 +237,10 @@ impl NoiseTcpStream {
     /// which is used for authentication and encryption of the proceeding handshake, which establishes
     /// a session key with perfect-forward secrecy.
     pub async fn handshake_responder_psk0(
-        mut socket: TcpStream,
+        socket: TcpStream,
         psk: &[u8],
     ) -> Result<NoiseTcpStream, NoiseError> {
-        let mut recv_cipher_buf = [0u8; 1024];
-        let mut recv_clear_buf = [0u8; 1024];
-        let mut send_buf = [0u8; 1024];
-
-        let mut responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
-            .psk(0, psk)
-            .build_responder()?;
-
-        // -> e
-        let read_n = socket.read(&mut recv_cipher_buf).await?;
-        responder.read_message(&recv_cipher_buf[..read_n], &mut recv_clear_buf)?;
-        debug!(
-            "[responder] received initial {}-byte message from initiator",
-            read_n
-        );
-
-        // <- e, ee
-        let wrote_n = responder.write_message(&[], &mut send_buf)?;
-        socket.write_all(&send_buf[..wrote_n]).await?;
-        debug!(
-            "[responder] sent initial {}-byte reply to initiator",
-            wrote_n
-        );
-
-        let chan = NoiseTcpStream::new(
-            "responder".to_string(),
-            socket,
-            responder.into_transport_mode()?,
-        );
-
-        info!("[responder] completed noise handshake");
-        Ok(chan)
+        NoiseTcpStream::handshake_responder(socket, NNpsk0::new(psk)).await
     }
 
     /// Send some arbitrary data over the noise-encrypted channel.
