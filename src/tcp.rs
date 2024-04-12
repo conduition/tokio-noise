@@ -17,13 +17,11 @@ use crate::handshakes::{Handshake, NNpsk0};
 
 /// Ciphertext packet fields and total size.
 const CIPHERTEXT_TAG_SIZE: usize = 16;
-const CIPHERTEXT_NONCE_SIZE: usize = 8;
 const CIPHERTEXT_PACKET_SIZE: usize = 2048;
 
 /// Plaintext packet fields and and total size.
 const PLAINTEXT_LEN_SIZE: usize = 2;
-const PLAINTEXT_PACKET_SIZE: usize =
-    CIPHERTEXT_PACKET_SIZE - CIPHERTEXT_TAG_SIZE - CIPHERTEXT_NONCE_SIZE;
+const PLAINTEXT_PACKET_SIZE: usize = CIPHERTEXT_PACKET_SIZE - CIPHERTEXT_TAG_SIZE;
 
 /// The maximum size of an unencrypted message the caller can send.
 const PLAINTEXT_MAX_SIZE: usize = PLAINTEXT_PACKET_SIZE - PLAINTEXT_LEN_SIZE;
@@ -363,13 +361,9 @@ impl AsyncWrite for NoiseTcpStream {
 
         let nonce = self.noise.sending_nonce();
         let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
-        write_u64(&mut ciphertext[..CIPHERTEXT_NONCE_SIZE], nonce);
 
-        let wrote_n = match self
-            .noise
-            .write_message(&plaintext, &mut ciphertext[CIPHERTEXT_NONCE_SIZE..])
-        {
-            Ok(n) => n + CIPHERTEXT_NONCE_SIZE,
+        let wrote_n = match self.noise.write_message(&plaintext, &mut ciphertext) {
+            Ok(n) => n,
             Err(e) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -476,90 +470,89 @@ impl AsyncRead for NoiseTcpStream {
             self.unprocessed_buf = self.unprocessed_buf.split_off(CIPHERTEXT_PACKET_SIZE);
 
             let mut cleartext = [0u8; PLAINTEXT_PACKET_SIZE];
-            let mut our_nonce = self.noise.receiving_nonce();
-            let their_nonce = read_u64(&ciphertext[..CIPHERTEXT_NONCE_SIZE]);
 
-            // Sometimes the remote side will encounter a problem sending, and for safety
-            // they cannot reuse nonces. So they specify which nonce they used in each
-            // message. As long as the nonce claimed by the remote side is no lower than
-            // the nonce in our local state, and not higher than some sane limit,
-            // it is safe to update our receiving nonce to match.
-            if their_nonce > our_nonce && their_nonce < our_nonce + NONCE_JUMP_LIMIT {
-                our_nonce = their_nonce;
-                self.noise.set_receiving_nonce(their_nonce);
-            }
+            let starting_nonce = self.noise.receiving_nonce();
+            let mut jumping_nonce = starting_nonce;
 
-            match self
-                .noise
-                .read_message(&ciphertext[CIPHERTEXT_NONCE_SIZE..], &mut cleartext)
-            {
-                Ok(read_n) => {
-                    assert_eq!(read_n, PLAINTEXT_PACKET_SIZE);
+            let read_n = loop {
+                match self.noise.read_message(&ciphertext, &mut cleartext) {
+                    Ok(read_n) => break read_n,
 
-                    let plaintext_len = read_u16(&cleartext[..PLAINTEXT_LEN_SIZE]) as usize;
-                    if plaintext_len > PLAINTEXT_MAX_SIZE {
+                    // Sometimes the remote side will encounter a problem sending, and for safety
+                    // they cannot reuse nonces. So they specify which nonce they used in each
+                    // message. As long as the nonce claimed by the remote side is no lower than
+                    // the nonce in our local state, and not higher than some sane limit,
+                    // it is safe to update our receiving nonce to match.
+                    Err(snow::Error::Decrypt)
+                        if jumping_nonce - starting_nonce < NONCE_JUMP_LIMIT =>
+                    {
+                        jumping_nonce += 1;
+                        self.noise.set_receiving_nonce(jumping_nonce);
+                        continue;
+                    }
+
+                    Err(e) => {
+                        error!(
+                            "[{}] poll_read ERROR; ciphertext={} nonce={}; error message: {}",
+                            self.name,
+                            ciphertext.len(),
+                            self.noise.receiving_nonce(),
+                            e
+                        );
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!(
-                                "plaintext packet specifies length={}; exceeds maximum of {}",
-                                plaintext_len, PLAINTEXT_MAX_SIZE
-                            ),
+                            e.to_string(),
                         )));
                     }
-
-                    let message = &cleartext[PLAINTEXT_LEN_SIZE..][..plaintext_len];
-
-                    trace!(
-                        "[{}] poll_read OK; ciphertext={} plaintext={} remaining={} nonce={}",
-                        self.name,
-                        ciphertext.len(),
-                        message.len(),
-                        output_buf.remaining(),
-                        our_nonce
-                    );
-
-                    // No room left in output buffer. Fill it and return.
-                    if output_buf.remaining() <= message.len() {
-                        output_buf.put_slice(&message[..output_buf.remaining()]);
-                        self.read_overflow_buf
-                            .extend(&message[output_buf.remaining()..]);
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    output_buf.put_slice(message);
-                    total_read += message.len();
-                }
-
-                Err(e) => {
-                    error!(
-                        "[{}] poll_read ERROR; ciphertext={} nonce={}; error message: {}",
-                        self.name,
-                        ciphertext.len(),
-                        our_nonce,
-                        e
-                    );
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    )));
-                }
+                };
             };
+
+            assert_eq!(
+                read_n, PLAINTEXT_PACKET_SIZE,
+                "should have decrypted exactly {} plaintext bytes, got {}",
+                PLAINTEXT_PACKET_SIZE, read_n
+            );
+
+            let plaintext_len = read_u16(&cleartext[..PLAINTEXT_LEN_SIZE]) as usize;
+            if plaintext_len > PLAINTEXT_MAX_SIZE {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "plaintext packet specifies length={}; exceeds maximum of {}",
+                        plaintext_len, PLAINTEXT_MAX_SIZE
+                    ),
+                )));
+            }
+
+            let message = &cleartext[PLAINTEXT_LEN_SIZE..][..plaintext_len];
+
+            trace!(
+                "[{}] poll_read OK; ciphertext={} plaintext={} remaining={} nonce={}",
+                self.name,
+                ciphertext.len(),
+                message.len(),
+                output_buf.remaining(),
+                self.noise.receiving_nonce()
+            );
+
+            // No room left in output buffer. Fill it and return.
+            if output_buf.remaining() <= message.len() {
+                output_buf.put_slice(&message[..output_buf.remaining()]);
+                self.read_overflow_buf
+                    .extend(&message[output_buf.remaining()..]);
+                return Poll::Ready(Ok(()));
+            }
+
+            output_buf.put_slice(message);
+            total_read += message.len();
         }
     }
 }
 
-fn write_u64(buf: &mut [u8], n: u64) {
-    buf.copy_from_slice(&n.to_be_bytes());
-}
 fn write_u16(buf: &mut [u8], n: u16) {
     buf.copy_from_slice(&n.to_be_bytes());
 }
 
-fn read_u64(buf: &[u8]) -> u64 {
-    let mut array = [0u8; 8];
-    array.copy_from_slice(buf);
-    u64::from_be_bytes(array)
-}
 fn read_u16(buf: &[u8]) -> u16 {
     let mut array = [0u8; 2];
     array.copy_from_slice(buf);
