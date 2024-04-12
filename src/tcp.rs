@@ -1,7 +1,5 @@
-use bytes::BufMut;
 use log::{debug, error, info, trace, warn};
 use std::{
-    collections::VecDeque,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -35,7 +33,7 @@ pub struct NoiseTcpStream {
     name: String,
     tcp: TcpStream,
     noise: snow::TransportState,
-    read_overflow_buf: VecDeque<u8>,
+    read_overflow_buf: Vec<u8>,
     unprocessed_buf: Vec<u8>,
 }
 
@@ -47,7 +45,7 @@ impl NoiseTcpStream {
             name,
             tcp: socket,
             noise,
-            read_overflow_buf: VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE),
+            read_overflow_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
             unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         }
     }
@@ -72,7 +70,7 @@ impl NoiseTcpStream {
             wrote_n
         );
 
-        let mut read_overflow_buf = VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE);
+        let mut read_overflow_buf = Vec::with_capacity(CIPHERTEXT_PACKET_SIZE);
 
         // <- 2
         if !initiator.is_handshake_finished() {
@@ -169,7 +167,7 @@ impl NoiseTcpStream {
             read_cipher_n
         );
 
-        let mut read_overflow_buf = VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE);
+        let mut read_overflow_buf = Vec::with_capacity(CIPHERTEXT_PACKET_SIZE);
 
         // <- 2
         if !responder.is_handshake_finished() {
@@ -425,11 +423,19 @@ impl AsyncRead for NoiseTcpStream {
                 return Poll::Ready(Ok(()));
             }
 
-            while let Some(byte) = self.read_overflow_buf.pop_front() {
-                output_buf.put_u8(byte);
+            if self.read_overflow_buf.len() > 0 {
+                let n_overflow_to_write = self.read_overflow_buf.len().min(output_buf.remaining());
+                output_buf.put_slice(&self.read_overflow_buf[..n_overflow_to_write]);
                 if output_buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
                 }
+                trace!(
+                    "[{}] popped {} bytes from overflow buffer",
+                    self.name,
+                    n_overflow_to_write
+                );
+
+                drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
             }
 
             let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
@@ -531,19 +537,24 @@ impl AsyncRead for NoiseTcpStream {
             let message = &cleartext[PLAINTEXT_LEN_SIZE..][..plaintext_len];
 
             trace!(
-                "[{}] poll_read OK; ciphertext={} plaintext={} remaining={} nonce={}",
+                "[{}] poll_read OK; ciphertext={} plaintext={} output_room={} nonce={}",
                 self.name,
                 ciphertext.len(),
                 message.len(),
                 output_buf.remaining(),
-                self.noise.receiving_nonce()
+                self.noise.receiving_nonce() - 1
             );
 
             // No room left in output buffer. Fill it and return.
             if output_buf.remaining() <= message.len() {
-                output_buf.put_slice(&message[..output_buf.remaining()]);
-                self.read_overflow_buf
-                    .extend(&message[output_buf.remaining()..]);
+                let (underflow, overflow) = message.split_at(output_buf.remaining());
+                self.read_overflow_buf.extend(overflow);
+                trace!(
+                    "[{}] pushed {} bytes to the read_overflow_buf",
+                    self.name,
+                    overflow.len()
+                );
+                output_buf.put_slice(underflow);
                 return Poll::Ready(Ok(()));
             }
 
@@ -563,11 +574,19 @@ fn read_u16(buf: &[u8]) -> u16 {
     u16::from_be_bytes(array)
 }
 
+fn drop_front_items<T: Clone>(vec: &mut Vec<T>, n_drop: usize) {
+    assert!(n_drop <= vec.len());
+    let n_remaining = vec.len() - n_drop;
+    for i in 0..n_remaining {
+        vec[i] = vec[n_drop + i].clone();
+    }
+    vec.truncate(n_remaining);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::{BodyExt, Empty, Full};
-    use hyper::body::Bytes;
+    use http_body_util::BodyExt;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
     use std::future::Future;
@@ -691,8 +710,8 @@ mod tests {
         let server_run = |noise_stream: NoiseTcpStream| async move {
             async fn service_fn(
                 _req: Request<hyper::body::Incoming>,
-            ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-                let resp = Response::new(Full::new(Bytes::from_static(b"Hello world!")));
+            ) -> Result<Response<String>, hyper::Error> {
+                let resp = Response::new("Hello world!".to_string());
                 Ok(resp)
             }
 
@@ -717,7 +736,7 @@ mod tests {
             });
 
             // Create an HTTP request with an empty body
-            let req = Request::builder().body(Empty::<Bytes>::new()).unwrap();
+            let req = Request::builder().body("".to_string()).unwrap();
 
             let res = sender
                 .send_request(req)
@@ -747,7 +766,7 @@ mod tests {
         let server_run = |noise_stream: NoiseTcpStream| async move {
             async fn service_fn(
                 req: Request<hyper::body::Incoming>,
-            ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+            ) -> Result<Response<String>, hyper::Error> {
                 let request_bytes = req
                     .collect()
                     .await
@@ -756,7 +775,7 @@ mod tests {
 
                 assert_eq!(request_bytes, b"Client says hi".as_ref());
 
-                let resp = Response::new(Full::new(Bytes::from_static(b"Hello client!")));
+                let resp = Response::new("Hello client!".to_string());
                 Ok(resp)
             }
 
@@ -783,7 +802,7 @@ mod tests {
             // Create an HTTP POST request with body
             let req = Request::builder()
                 .method("POST")
-                .body(Full::new(Bytes::from_static(b"Client says hi")))
+                .body("Client says hi".to_string())
                 .unwrap();
 
             let res = sender
@@ -807,5 +826,108 @@ mod tests {
         };
 
         run_client_server_test(server_run, client_run).await;
+    }
+
+    #[tokio::test]
+    async fn http1_post_large() {
+        let server_run = |noise_stream: NoiseTcpStream| async move {
+            async fn service_fn(
+                req: Request<hyper::body::Incoming>,
+            ) -> Result<Response<String>, hyper::Error> {
+                let expected_body = "hello".repeat(3000);
+
+                let request_bytes: bytes::Bytes = req
+                    .collect()
+                    .await
+                    .expect("server error reading request body")
+                    .to_bytes();
+
+                assert_eq!(
+                    String::from_utf8_lossy(&request_bytes).as_ref(),
+                    expected_body
+                );
+
+                let resp = Response::new(expected_body);
+                Ok(resp)
+            }
+
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(noise_stream),
+                    hyper::service::service_fn(service_fn),
+                )
+                .await
+                .expect("error serving HTTP1 POST request");
+        };
+
+        let client_run = |noise_stream: NoiseTcpStream| async move {
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(noise_stream))
+                    .await
+                    .expect("client failed to run HTTP1 handshake");
+
+            // Spawn a task to poll the connection, driving the HTTP state
+            let driver = spawn(async move {
+                conn.await.expect("client connection driver failed");
+            });
+
+            let expected_body = "hello".repeat(3000);
+
+            // Create an HTTP POST request with body
+            let req = Request::builder()
+                .method("POST")
+                .body(expected_body.clone())
+                .unwrap();
+
+            let res = sender
+                .send_request(req)
+                .await
+                .expect("client failed to send HTTP1 POST request");
+
+            assert_eq!(res.status(), 200);
+
+            let response_bytes = res
+                .collect()
+                .await
+                .expect("client error reading response body")
+                .to_bytes();
+
+            // Close the connection
+            drop(sender);
+            driver.await.unwrap();
+
+            assert_eq!(response_bytes, expected_body.as_bytes());
+        };
+
+        run_client_server_test(server_run, client_run).await;
+    }
+
+    #[test]
+    fn test_drop_front_items() {
+        {
+            let mut vec = vec![0, 1, 2, 3, 4];
+            drop_front_items(&mut vec, 2);
+            assert_eq!(vec, vec![2, 3, 4]);
+        }
+        {
+            let mut vec = vec![0, 1, 2, 3, 4];
+            drop_front_items(&mut vec, 0);
+            assert_eq!(vec, vec![0, 1, 2, 3, 4]);
+        }
+        {
+            let mut vec = vec![0, 1, 2, 3, 4];
+            drop_front_items(&mut vec, 5);
+            assert_eq!(vec, vec![]);
+        }
+        {
+            let mut vec = vec![0];
+            drop_front_items(&mut vec, 1);
+            assert_eq!(vec, vec![]);
+        }
+        {
+            let mut vec: Vec<usize> = vec![];
+            drop_front_items(&mut vec, 0);
+            assert_eq!(vec, vec![]);
+        }
     }
 }
