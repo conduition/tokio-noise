@@ -27,7 +27,7 @@ const PLAINTEXT_MAX_SIZE: usize = PLAINTEXT_PACKET_SIZE - PLAINTEXT_LEN_SIZE;
 /// The maximum gap by which a remote side can increment our receiving nonce.
 const NONCE_JUMP_LIMIT: u64 = 10;
 
-/// Represents a [`tokio::io::TcpStream`] wrapped with a layer of [Noise](https://noiseprotocol.org/)
+/// Represents a [`tokio::net::TcpStream`] wrapped with a layer of [Noise](https://noiseprotocol.org/)
 /// encryption applied on top.
 pub struct NoiseTcpStream {
     name: String,
