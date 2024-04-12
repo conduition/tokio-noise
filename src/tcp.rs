@@ -645,7 +645,7 @@ mod tests {
                 conn.await.expect("client connection driver failed");
             });
 
-            // Create an HTTP request with an empty body and a HOST header
+            // Create an HTTP request with an empty body
             let req = Request::builder().body(Empty::<Bytes>::new()).unwrap();
 
             let res = sender
@@ -666,6 +666,73 @@ mod tests {
             driver.await.unwrap();
 
             assert_eq!(response_bytes, b"Hello world!".as_ref());
+        };
+
+        run_client_server_test(server_run, client_run).await;
+    }
+
+    #[tokio::test]
+    async fn http1_post() {
+        let server_run = |noise_stream: NoiseTcpStream| async move {
+            async fn service_fn(
+                req: Request<hyper::body::Incoming>,
+            ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+                let request_bytes = req
+                    .collect()
+                    .await
+                    .expect("server error reading request body")
+                    .to_bytes();
+
+                assert_eq!(request_bytes, b"Client says hi".as_ref());
+
+                let resp = Response::new(Full::new(Bytes::from_static(b"Hello client!")));
+                Ok(resp)
+            }
+
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(noise_stream),
+                    hyper::service::service_fn(service_fn),
+                )
+                .await
+                .expect("error serving HTTP1 POST request");
+        };
+
+        let client_run = |noise_stream: NoiseTcpStream| async move {
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(noise_stream))
+                    .await
+                    .expect("client failed to run HTTP1 handshake");
+
+            // Spawn a task to poll the connection, driving the HTTP state
+            let driver = spawn(async move {
+                conn.await.expect("client connection driver failed");
+            });
+
+            // Create an HTTP POST request with body
+            let req = Request::builder()
+                .method("POST")
+                .body(Full::new(Bytes::from_static(b"Client says hi")))
+                .unwrap();
+
+            let res = sender
+                .send_request(req)
+                .await
+                .expect("client failed to send HTTP1 POST request");
+
+            assert_eq!(res.status(), 200);
+
+            let response_bytes = res
+                .collect()
+                .await
+                .expect("client error reading response body")
+                .to_bytes();
+
+            // Close the connection
+            drop(sender);
+            driver.await.unwrap();
+
+            assert_eq!(response_bytes, b"Hello client!".as_ref());
         };
 
         run_client_server_test(server_run, client_run).await;
