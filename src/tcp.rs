@@ -15,11 +15,21 @@ use tokio::{
 use crate::errors::NoiseError;
 use crate::handshakes::{Handshake, NNpsk0};
 
-const NOISE_TAG_SIZE: usize = 16;
-const NOISE_NONCE_SIZE: usize = 8;
+/// Ciphertext packet fields and total size.
+const CIPHERTEXT_TAG_SIZE: usize = 16;
+const CIPHERTEXT_NONCE_SIZE: usize = 8;
 const CIPHERTEXT_PACKET_SIZE: usize = 2048;
-const PLAINTEXT_PACKET_SIZE: usize = CIPHERTEXT_PACKET_SIZE - NOISE_TAG_SIZE - NOISE_NONCE_SIZE;
-const MIN_CIPHERTEXT_PACKET_SIZE: usize = NOISE_NONCE_SIZE + NOISE_TAG_SIZE;
+
+/// Plaintext packet fields and and total size.
+const PLAINTEXT_LEN_SIZE: usize = 2;
+const PLAINTEXT_PACKET_SIZE: usize =
+    CIPHERTEXT_PACKET_SIZE - CIPHERTEXT_TAG_SIZE - CIPHERTEXT_NONCE_SIZE;
+
+/// The maximum size of an unencrypted message the caller can send.
+const PLAINTEXT_MAX_SIZE: usize = PLAINTEXT_PACKET_SIZE - PLAINTEXT_LEN_SIZE;
+
+/// The maximum gap by which a remote side can increment our receiving nonce.
+const NONCE_JUMP_LIMIT: u64 = 10;
 
 /// Represents a [`tokio::io::TcpStream`] wrapped with a layer of [Noise](https://noiseprotocol.org/)
 /// encryption applied on top.
@@ -28,6 +38,7 @@ pub struct NoiseTcpStream {
     tcp: TcpStream,
     noise: snow::TransportState,
     read_overflow_buf: VecDeque<u8>,
+    unprocessed_buf: Vec<u8>,
 }
 
 impl NoiseTcpStream {
@@ -39,6 +50,7 @@ impl NoiseTcpStream {
             tcp: socket,
             noise,
             read_overflow_buf: VecDeque::with_capacity(CIPHERTEXT_PACKET_SIZE),
+            unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         }
     }
 
@@ -126,6 +138,7 @@ impl NoiseTcpStream {
             tcp: socket,
             noise: initiator.into_transport_mode()?,
             read_overflow_buf,
+            unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         };
 
         info!("[initiator] completed noise handshake");
@@ -213,6 +226,7 @@ impl NoiseTcpStream {
             tcp: socket,
             noise: responder.into_transport_mode()?,
             read_overflow_buf,
+            unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         };
 
         info!("[responder] completed noise handshake");
@@ -244,6 +258,9 @@ impl NoiseTcpStream {
     }
 
     /// Send some arbitrary data over the noise-encrypted channel.
+    ///
+    /// Noise messages are chunked and padded into fixed-size packets for easier transmission
+    /// control.
     pub async fn send(&mut self, cleartext: &[u8]) -> Result<(), NoiseError> {
         AsyncWriteExt::write_all(self, cleartext).await?;
         Ok(())
@@ -252,6 +269,19 @@ impl NoiseTcpStream {
     /// Receive some arbitrary data over the noise-encrypted channel.
     pub async fn recv(&mut self, output: &mut [u8]) -> Result<usize, NoiseError> {
         Ok(AsyncReadExt::read(self, output).await?)
+    }
+
+    /// Returns the number of unprocessed ciphertext bytes currently buffered and awaiting
+    /// follow up in the stream.
+    ///
+    /// Sometimes a stream will receive a partial ciphertext packet and must buffer
+    /// it, awaiting the remainder from the remote side before decryption can occur.
+    ///
+    /// If any unprocessed ciphertext remains after a `recv` call or other reading IO operation
+    /// on the `NoiseTcpStream`, it may indicate a synchronicity failure between the local and
+    /// remote sides of the connection.
+    pub fn unprocessed_ciphertext_len(&self) -> usize {
+        self.unprocessed_buf.len()
     }
 
     /// Wraps [`TcpStream::nodelay`].
@@ -324,19 +354,22 @@ impl AsyncWrite for NoiseTcpStream {
             Poll::Pending => return Poll::Pending,
         };
 
-        let nonce = self.noise.sending_nonce();
-
-        if buf.len() > PLAINTEXT_PACKET_SIZE {
-            buf = &buf[..PLAINTEXT_PACKET_SIZE];
+        if buf.len() > PLAINTEXT_MAX_SIZE {
+            buf = &buf[..PLAINTEXT_MAX_SIZE];
         }
+        let mut plaintext = [0u8; PLAINTEXT_PACKET_SIZE];
+        write_u16(&mut plaintext[..PLAINTEXT_LEN_SIZE], buf.len() as u16);
+        plaintext[PLAINTEXT_LEN_SIZE..][..buf.len()].copy_from_slice(buf);
 
+        let nonce = self.noise.sending_nonce();
         let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
-        write_u64(&mut ciphertext[..NOISE_NONCE_SIZE], nonce);
+        write_u64(&mut ciphertext[..CIPHERTEXT_NONCE_SIZE], nonce);
+
         let wrote_n = match self
             .noise
-            .write_message(buf, &mut ciphertext[NOISE_NONCE_SIZE..])
+            .write_message(&plaintext, &mut ciphertext[CIPHERTEXT_NONCE_SIZE..])
         {
-            Ok(n) => n + NOISE_NONCE_SIZE,
+            Ok(n) => n + CIPHERTEXT_NONCE_SIZE,
             Err(e) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -394,6 +427,10 @@ impl AsyncRead for NoiseTcpStream {
     ) -> Poll<Result<(), io::Error>> {
         let mut total_read = 0;
         loop {
+            if output_buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
             while let Some(byte) = self.read_overflow_buf.pop_front() {
                 output_buf.put_u8(byte);
                 if output_buf.remaining() == 0 {
@@ -424,57 +461,80 @@ impl AsyncRead for NoiseTcpStream {
                 return Poll::Ready(Ok(()));
             }
 
-            // Invalid noise message.
-            if filled.len() < MIN_CIPHERTEXT_PACKET_SIZE {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "received message is too short to hold noise message",
-                )));
+            self.unprocessed_buf.extend(filled);
+            if self.unprocessed_buf.len() < CIPHERTEXT_PACKET_SIZE {
+                trace!(
+                    "[{}] continuing with zero advancement, len={}",
+                    self.name,
+                    self.unprocessed_buf.len()
+                );
+                continue;
             }
+            ciphertext[..].copy_from_slice(&self.unprocessed_buf[..CIPHERTEXT_PACKET_SIZE]);
+
+            // Pop the ciphertext we're about to process from the unprocessed queue.
+            self.unprocessed_buf = self.unprocessed_buf.split_off(CIPHERTEXT_PACKET_SIZE);
 
             let mut cleartext = [0u8; PLAINTEXT_PACKET_SIZE];
             let mut our_nonce = self.noise.receiving_nonce();
-            let their_nonce = read_u64(&filled[..NOISE_NONCE_SIZE]);
+            let their_nonce = read_u64(&ciphertext[..CIPHERTEXT_NONCE_SIZE]);
 
             // Sometimes the remote side will encounter a problem sending, and for safety
             // they cannot reuse nonces. So they specify which nonce they used in each
             // message. As long as the nonce claimed by the remote side is no lower than
-            // the nonce in our local state, it is safe to update our receiving nonce to match.
-            if their_nonce > our_nonce {
+            // the nonce in our local state, and not higher than some sane limit,
+            // it is safe to update our receiving nonce to match.
+            if their_nonce > our_nonce && their_nonce < our_nonce + NONCE_JUMP_LIMIT {
                 our_nonce = their_nonce;
                 self.noise.set_receiving_nonce(their_nonce);
             }
 
             match self
                 .noise
-                .read_message(&filled[NOISE_NONCE_SIZE..], &mut cleartext)
+                .read_message(&ciphertext[CIPHERTEXT_NONCE_SIZE..], &mut cleartext)
             {
                 Ok(read_n) => {
+                    assert_eq!(read_n, PLAINTEXT_PACKET_SIZE);
+
+                    let plaintext_len = read_u16(&cleartext[..PLAINTEXT_LEN_SIZE]) as usize;
+                    if plaintext_len > PLAINTEXT_MAX_SIZE {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "plaintext packet specifies length={}; exceeds maximum of {}",
+                                plaintext_len, PLAINTEXT_MAX_SIZE
+                            ),
+                        )));
+                    }
+
+                    let message = &cleartext[PLAINTEXT_LEN_SIZE..][..plaintext_len];
+
                     trace!(
-                        "[{}] poll_read OK; ciphertext={} plaintext={} nonce={}",
+                        "[{}] poll_read OK; ciphertext={} plaintext={} remaining={} nonce={}",
                         self.name,
-                        filled.len(),
-                        read_n,
+                        ciphertext.len(),
+                        message.len(),
+                        output_buf.remaining(),
                         our_nonce
                     );
 
                     // No room left in output buffer. Fill it and return.
-                    if output_buf.remaining() <= read_n {
-                        output_buf.put_slice(&cleartext[..output_buf.remaining()]);
+                    if output_buf.remaining() <= message.len() {
+                        output_buf.put_slice(&message[..output_buf.remaining()]);
                         self.read_overflow_buf
-                            .extend(&cleartext[output_buf.remaining()..read_n]);
+                            .extend(&message[output_buf.remaining()..]);
                         return Poll::Ready(Ok(()));
                     }
 
-                    output_buf.put_slice(&cleartext[..read_n]);
-                    total_read += read_n;
+                    output_buf.put_slice(message);
+                    total_read += message.len();
                 }
 
                 Err(e) => {
                     error!(
                         "[{}] poll_read ERROR; ciphertext={} nonce={}; error message: {}",
                         self.name,
-                        filled.len(),
+                        ciphertext.len(),
                         our_nonce,
                         e
                     );
@@ -491,11 +551,19 @@ impl AsyncRead for NoiseTcpStream {
 fn write_u64(buf: &mut [u8], n: u64) {
     buf.copy_from_slice(&n.to_be_bytes());
 }
+fn write_u16(buf: &mut [u8], n: u16) {
+    buf.copy_from_slice(&n.to_be_bytes());
+}
 
 fn read_u64(buf: &[u8]) -> u64 {
     let mut array = [0u8; 8];
     array.copy_from_slice(buf);
     u64::from_be_bytes(array)
+}
+fn read_u16(buf: &[u8]) -> u16 {
+    let mut array = [0u8; 2];
+    array.copy_from_slice(buf);
+    u16::from_be_bytes(array)
 }
 
 #[cfg(test)]
@@ -581,11 +649,14 @@ mod tests {
         const BIG_SIZE: usize = 200_000;
 
         let server_run = |mut noise_stream: NoiseTcpStream| async move {
+            let mut n = 0;
             let mut big_buf = [0u8; BIG_SIZE];
-            let n = noise_stream
-                .recv(&mut big_buf)
-                .await
-                .expect("server failed to receive big chunk of data");
+            while n < big_buf.len() {
+                n += noise_stream
+                    .recv(&mut big_buf[n..])
+                    .await
+                    .expect("server failed to receive big chunk of data");
+            }
 
             assert_eq!(n, BIG_SIZE);
             assert_eq!(big_buf, [0xFF; BIG_SIZE]);
@@ -603,10 +674,13 @@ mod tests {
                 .await
                 .expect("client failed to send big chunk of data");
 
-            let n = noise_stream
-                .recv(&mut big_buf)
-                .await
-                .expect("client failed to receive big chunk of data");
+            let mut n = 0;
+            while n < big_buf.len() {
+                n += noise_stream
+                    .recv(&mut big_buf[n..])
+                    .await
+                    .expect("client failed to receive big chunk of data");
+            }
 
             assert_eq!(n, BIG_SIZE);
             assert_eq!(big_buf, [0xFF; BIG_SIZE]);
