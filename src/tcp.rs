@@ -472,7 +472,7 @@ impl AsyncRead for NoiseTcpStream {
             let mut cleartext = [0u8; PLAINTEXT_PACKET_SIZE];
 
             let starting_nonce = self.noise.receiving_nonce();
-            let mut jumping_nonce = starting_nonce;
+            let mut n_attempts = 0;
 
             let read_n = loop {
                 match self.noise.read_message(&ciphertext, &mut cleartext) {
@@ -483,11 +483,15 @@ impl AsyncRead for NoiseTcpStream {
                     // message. As long as the nonce claimed by the remote side is no lower than
                     // the nonce in our local state, and not higher than some sane limit,
                     // it is safe to update our receiving nonce to match.
-                    Err(snow::Error::Decrypt)
-                        if jumping_nonce - starting_nonce < NONCE_JUMP_LIMIT =>
-                    {
-                        jumping_nonce += 1;
-                        self.noise.set_receiving_nonce(jumping_nonce);
+                    Err(snow::Error::Decrypt) if n_attempts < NONCE_JUMP_LIMIT => {
+                        n_attempts += 1;
+                        warn!(
+                            "[{}] decryption failed; attempts={} nonce={}; retrying",
+                            self.name,
+                            n_attempts,
+                            self.noise.receiving_nonce()
+                        );
+                        self.noise.set_receiving_nonce(starting_nonce + n_attempts);
                         continue;
                     }
 
