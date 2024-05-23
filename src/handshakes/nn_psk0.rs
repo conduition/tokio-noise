@@ -1,3 +1,9 @@
+//! This module encapsulates the [`NNpsk0`] handshake.
+//!
+//! With the `NNpsk0` handshake, both parties know a pre-shared key (PSK)
+//! which is mixed into the handshake before any communication takes place.
+//! Every message is protected by the PSK.
+
 use snow::params::{
     BaseChoice, HandshakeChoice, HandshakeModifier, HandshakeModifierList, HandshakePattern,
     NoiseParams,

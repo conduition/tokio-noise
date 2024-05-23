@@ -1,3 +1,15 @@
+//! This module encapsulates the [`NNpsk2`] handshake.
+//!
+//! With the `NNpsk2` handshake, both parties know a common pre-shared key (PSK),
+//! but the responder may need some information from the initiator to tell them
+//! which PSK to use. The initiator supplies an 'identity' message which the responder
+//! can use to look up the correct PSK. The initiator is assumed to already know
+//! that same PSK.
+//!
+//! The PSK is then mixed into the handshake during the responder's first reply.
+//! That and every successive message is protected by the PSK, but the
+//! initiator's first identity message is not protected or authenticated.
+
 use snow::{
     params::{
         BaseChoice, HandshakeChoice, HandshakeModifier, HandshakeModifierList, HandshakePattern,
@@ -10,6 +22,8 @@ use crate::errors::NoiseError;
 
 use super::{CryptoChoices, Handshake};
 
+/// The `Initiator` is the [`NNpsk2`] party responsible for sending the first message
+/// including her own identity. The initiator should already know the PSK.
 #[derive(Clone, Copy, Debug)]
 pub struct Initiator<'p> {
     /// The identity given in plaintext to the responder.
@@ -20,6 +34,9 @@ pub struct Initiator<'p> {
     pub psk: &'p [u8],
 }
 
+/// The `Responder` is the [`NNpsk2`] party responsible for receiving the first message
+/// containing the [`Initiator`]'s identity. The responder looks up the PSK for the initiator
+/// based on their self-reported identity, using a closure.
 #[derive(Clone, Debug)]
 pub struct Responder<F: FnMut(&[u8]) -> Option<&[u8]>> {
     find_psk: F,
@@ -27,6 +44,10 @@ pub struct Responder<F: FnMut(&[u8]) -> Option<&[u8]>> {
 }
 
 impl<F: FnMut(&[u8]) -> Option<&[u8]>> Responder<F> {
+    /// Construct a new [`Responder`] from a given PSK-finding callback.
+    ///
+    /// The `find_psk` closure should return `Some(psk)` if the identity corresponds to a known PSK,
+    /// or `None` if the identity is unknown/untrusted.
     pub fn new(find_psk: F) -> Self {
         Responder {
             find_psk,
@@ -34,6 +55,11 @@ impl<F: FnMut(&[u8]) -> Option<&[u8]>> Responder<F> {
         }
     }
 
+    /// Returns `Some(identity)`, giving the initiator's identity after a successful handshake
+    /// if the `find_psk` closure returned `Some(psk)` for that identity.
+    ///
+    /// Otherwise if the handshake failed, or if `find_psk` returned `None`, or if the handshake
+    /// was not completed yet, this method returns `None`.
     pub fn initiator_identity(&self) -> Option<&[u8]> {
         self.initiator_identity.as_ref().map(|vec| vec.as_ref())
     }
