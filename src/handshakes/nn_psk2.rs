@@ -38,12 +38,20 @@ pub struct Initiator<'p> {
 /// containing the [`Initiator`]'s identity. The responder looks up the PSK for the initiator
 /// based on their self-reported identity, using a closure.
 #[derive(Clone, Debug)]
-pub struct Responder<F: FnMut(&[u8]) -> Option<&[u8]>> {
+pub struct Responder<F, T>
+where
+    F: FnMut(&[u8]) -> Option<T>,
+    T: AsRef<[u8]>,
+{
     find_psk: F,
     initiator_identity: Option<Vec<u8>>,
 }
 
-impl<F: FnMut(&[u8]) -> Option<&[u8]>> Responder<F> {
+impl<F, T> Responder<F, T>
+where
+    F: FnMut(&[u8]) -> Option<T>,
+    T: AsRef<[u8]>,
+{
     /// Construct a new [`Responder`] from a given PSK-finding callback.
     ///
     /// The `find_psk` closure should return `Some(psk)` if the identity corresponds to a known PSK,
@@ -133,7 +141,11 @@ impl Handshake for NNpsk2<Initiator<'_>> {
     }
 }
 
-impl<F: FnMut(&[u8]) -> Option<&[u8]>> Handshake for NNpsk2<&mut Responder<F>> {
+impl<F, T> Handshake for NNpsk2<&mut Responder<F, T>>
+where
+    F: FnMut(&[u8]) -> Option<T>,
+    T: AsRef<[u8]>,
+{
     fn name(&self) -> String {
         self.choices.stringify_with_pattern("NNpsk2")
     }
@@ -172,7 +184,7 @@ impl<F: FnMut(&[u8]) -> Option<&[u8]>> Handshake for NNpsk2<&mut Responder<F>> {
             .ok_or_else(|| self.error("found no PSK for initiator"))?;
 
         self.party.initiator_identity = Some(Vec::from(initiator_identity));
-        responder.set_psk(2, psk)?;
+        responder.set_psk(2, psk.as_ref())?;
         Ok(responder.write_message(&[], send_buf)?)
     }
 }
