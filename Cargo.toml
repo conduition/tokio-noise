@@ -1,6 +1,6 @@
 [package]
 name = "tokio-noise"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 authors = ["conduition <conduition@proton.me>"]
 description = "A Noise protocol encryption layer on top of tokio streams."
