@@ -2,7 +2,7 @@
 
 An authenticated encryption layer on top of [tokio](https://tokio.rs) streams, driven by the [Noise Protocol Framework](https://noiseprotocol.org/).
 
-This library is [sponsored by DLC.Link](https://www.dlc.link/).
+This library is [sponsored by dlcBTC](https://www.dlcbtc.com).
 
 ## Usage
 
