@@ -35,6 +35,15 @@ pub struct NoiseTcpStream {
     noise: snow::TransportState,
     read_overflow_buf: Vec<u8>,
     unprocessed_buf: Vec<u8>,
+    /// Ciphertext from an already-encrypted packet that the underlying TCP
+    /// socket only partially accepted (or rejected with `WouldBlock`) on a
+    /// previous `poll_write`. The Noise nonce has already advanced for these
+    /// bytes, so they must be flushed verbatim — and before any new packet —
+    /// to keep the on-wire stream framed and the peer's nonce in sync. Drained
+    /// by `poll_drain_write_overflow`. Bounded to one packet
+    /// (`CIPHERTEXT_PACKET_SIZE`): a new packet is only encrypted once this is
+    /// empty.
+    write_overflow_buf: Vec<u8>,
 }
 
 impl NoiseTcpStream {
@@ -47,6 +56,7 @@ impl NoiseTcpStream {
             noise,
             read_overflow_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
             unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
+            write_overflow_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         }
     }
 
@@ -135,6 +145,7 @@ impl NoiseTcpStream {
             noise: initiator.into_transport_mode()?,
             read_overflow_buf,
             unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
+            write_overflow_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         };
 
         info!("[initiator] completed noise handshake");
@@ -223,6 +234,7 @@ impl NoiseTcpStream {
             noise: responder.into_transport_mode()?,
             read_overflow_buf,
             unprocessed_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
+            write_overflow_buf: Vec::with_capacity(CIPHERTEXT_PACKET_SIZE),
         };
 
         info!("[responder] completed noise handshake");
@@ -338,17 +350,48 @@ impl NoiseTcpStream {
     }
 }
 
+impl NoiseTcpStream {
+    /// Flush any ciphertext buffered from a previous partial write before any
+    /// new packet is produced. The Noise nonce already advanced for these
+    /// bytes, so they are written verbatim and in order to preserve the packet
+    /// framing the peer expects. Returns `Ready(Ok(()))` once the buffer is
+    /// empty, `Pending` (surfacing backpressure) while the socket can't take
+    /// it.
+    fn poll_drain_write_overflow(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        while !self.write_overflow_buf.is_empty() {
+            match AsyncWrite::poll_write(Pin::new(&mut self.tcp), cx, &self.write_overflow_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "underlying writer accepted none of the buffered noise ciphertext",
+                    )));
+                }
+                Poll::Ready(Ok(sent_n)) => drop_front_items(&mut self.write_overflow_buf, sent_n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl AsyncWrite for NoiseTcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        match self.tcp.poll_write_ready(cx) {
+        // Flush any ciphertext left over from a previous partial write first,
+        // so packets reach the peer in order and the nonce stays in sync. If
+        // the socket can't take it yet, surface backpressure to the caller.
+        match self.poll_drain_write_overflow(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
-        };
+        }
 
         if buf.len() > PLAINTEXT_MAX_SIZE {
             buf = &buf[..PLAINTEXT_MAX_SIZE];
@@ -378,35 +421,54 @@ impl AsyncWrite for NoiseTcpStream {
             nonce
         );
 
+        // The packet is encrypted and the nonce has advanced, so every
+        // ciphertext byte MUST reach the peer. If the socket accepts only part
+        // of it (a full send buffer under sustained load) or none of it, buffer
+        // the remainder in `write_overflow_buf` and report the plaintext as
+        // fully consumed — the tail is flushed by the drain above on the next
+        // poll, or by `poll_flush`. The original code `assert_eq!`d that the
+        // whole packet was written and panicked on a partial write; that is the
+        // bug this fixes.
         match AsyncWrite::poll_write(Pin::new(&mut self.tcp), cx, &ciphertext[..wrote_n]) {
             Poll::Ready(Ok(sent_n)) => {
                 trace!("[{}] poll_write sent {} bytes", self.name, sent_n);
-
-                // TODO what happens if we didn't write the full message?
-                assert_eq!(
-                    sent_n, wrote_n,
-                    "underlying writer didn't write the full noise message"
-                );
+                if sent_n < wrote_n {
+                    self.write_overflow_buf
+                        .extend_from_slice(&ciphertext[sent_n..wrote_n]);
+                }
                 Poll::Ready(Ok(buf.len()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
-                warn!(
-                    "[{}] hit pending state after noise state update; skipping nonce={}",
-                    self.name, nonce
-                );
-                Poll::Pending
+                // Socket became unwritable after encryption; buffer the whole
+                // packet so the nonce stays in sync, and report progress so the
+                // caller doesn't re-encrypt these bytes. The `tcp.poll_write`
+                // call above registered our waker; the drain on the next poll
+                // (or `poll_flush`) sends it.
+                self.write_overflow_buf
+                    .extend_from_slice(&ciphertext[..wrote_n]);
+                Poll::Ready(Ok(buf.len()))
             }
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        match self.poll_drain_write_overflow(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
         AsyncWrite::poll_flush(Pin::new(&mut self.tcp), cx)
     }
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        match self.poll_drain_write_overflow(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
         AsyncWrite::poll_shutdown(Pin::new(&mut self.tcp), cx)
     }
 }
@@ -417,6 +479,21 @@ impl AsyncRead for NoiseTcpStream {
         cx: &mut Context<'_>,
         output_buf: &mut io::ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        // Opportunistically flush any ciphertext left over from a previous
+        // partial write. A request/response caller that has finished writing
+        // and now only awaits a read would otherwise never drive
+        // `write_overflow_buf` out (`poll_write`/`poll_flush` are the only
+        // other drain points), so the peer never receives the full request and
+        // never replies — a deadlock. After a partial write `tcp.poll_write`
+        // returned `Ready`, so no write-readiness waker is even registered;
+        // draining here both makes progress and re-arms that waker on `Pending`.
+        // We deliberately ignore the drain's backpressure: a full send buffer
+        // must not block reads. A hard write error means the connection is
+        // broken, so surface it.
+        if let Poll::Ready(Err(e)) = self.poll_drain_write_overflow(cx) {
+            return Poll::Ready(Err(e));
+        }
+
         let mut total_read = 0;
         loop {
             if output_buf.remaining() == 0 {
