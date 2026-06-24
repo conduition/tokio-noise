@@ -47,7 +47,7 @@ impl<'a> Handshake for NNpsk0<'a> {
         self.choices.stringify_with_pattern("NNpsk0")
     }
 
-    fn new_builder(&self) -> snow::Builder {
+    fn new_builder(&self) -> snow::Builder<'_> {
         let params = NoiseParams {
             name: self.name(),
             base: BaseChoice::Noise,

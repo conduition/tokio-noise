@@ -107,7 +107,7 @@ impl Handshake for NNpsk2<Initiator<'_>> {
         self.choices.stringify_with_pattern("NNpsk2")
     }
 
-    fn new_builder(&self) -> snow::Builder {
+    fn new_builder(&self) -> snow::Builder<'_> {
         let params = NoiseParams {
             name: self.name(),
             base: BaseChoice::Noise,
@@ -150,7 +150,7 @@ where
         self.choices.stringify_with_pattern("NNpsk2")
     }
 
-    fn new_builder(&self) -> snow::Builder {
+    fn new_builder(&self) -> snow::Builder<'_> {
         let params = NoiseParams {
             name: self.name(),
             base: BaseChoice::Noise,

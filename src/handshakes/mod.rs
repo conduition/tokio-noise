@@ -86,7 +86,7 @@ pub trait Handshake {
     /// Construct a handshake state [`Builder`][snow::Builder]. This can be useful for setting a custom
     /// [`CryptoResolver`][snow::resolvers::CryptoResolver], or to set pre-shared symmetric keys or
     /// known static public keys.
-    fn new_builder(&self) -> snow::Builder;
+    fn new_builder(&self) -> snow::Builder<'_>;
 
     /// Creates the initiator's first message. This begins the Noise conversation.
     ///
