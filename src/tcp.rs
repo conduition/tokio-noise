@@ -35,14 +35,8 @@ pub struct NoiseTcpStream {
     noise: snow::TransportState,
     read_overflow_buf: Vec<u8>,
     unprocessed_buf: Vec<u8>,
-    /// Ciphertext from an already-encrypted packet that the underlying TCP
-    /// socket only partially accepted (or rejected with `WouldBlock`) on a
-    /// previous `poll_write`. The Noise nonce has already advanced for these
-    /// bytes, so they must be flushed verbatim — and before any new packet —
-    /// to keep the on-wire stream framed and the peer's nonce in sync. Drained
-    /// by `poll_drain_write_overflow`. Bounded to one packet
-    /// (`CIPHERTEXT_PACKET_SIZE`): a new packet is only encrypted once this is
-    /// empty.
+    /// Ciphertext from a previous partial write, awaiting flush. Drained by
+    /// [`NoiseTcpStream::poll_drain_write_overflow`].
     write_overflow_buf: Vec<u8>,
 }
 
@@ -351,12 +345,13 @@ impl NoiseTcpStream {
 }
 
 impl NoiseTcpStream {
-    /// Flush any ciphertext buffered from a previous partial write before any
-    /// new packet is produced. The Noise nonce already advanced for these
-    /// bytes, so they are written verbatim and in order to preserve the packet
-    /// framing the peer expects. Returns `Ready(Ok(()))` once the buffer is
-    /// empty, `Pending` (surfacing backpressure) while the socket can't take
-    /// it.
+    /// Flush ciphertext buffered from a previous partial write before any new
+    /// packet is produced. The Noise nonce already advanced for these bytes, so
+    /// they are written verbatim and in order to preserve the packet framing the
+    /// peer expects. The buffer holds at most one packet (`CIPHERTEXT_PACKET_SIZE`):
+    /// a new packet is only encrypted once it is empty, so it cannot grow
+    /// unboundedly. Returns `Ready(Ok(()))` once drained, or `Pending`
+    /// (surfacing backpressure) while the socket can't take it.
     fn poll_drain_write_overflow(
         &mut self,
         cx: &mut Context<'_>,
@@ -426,9 +421,7 @@ impl AsyncWrite for NoiseTcpStream {
         // of it (a full send buffer under sustained load) or none of it, buffer
         // the remainder in `write_overflow_buf` and report the plaintext as
         // fully consumed — the tail is flushed by the drain above on the next
-        // poll, or by `poll_flush`. The original code `assert_eq!`d that the
-        // whole packet was written and panicked on a partial write; that is the
-        // bug this fixes.
+        // poll, or by `poll_flush`.
         match AsyncWrite::poll_write(Pin::new(&mut self.tcp), cx, &ciphertext[..wrote_n]) {
             Poll::Ready(Ok(sent_n)) => {
                 trace!("[{}] poll_write sent {} bytes", self.name, sent_n);
