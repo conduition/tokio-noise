@@ -496,16 +496,20 @@ impl AsyncRead for NoiseTcpStream {
             if self.read_overflow_buf.len() > 0 {
                 let n_overflow_to_write = self.read_overflow_buf.len().min(output_buf.remaining());
                 output_buf.put_slice(&self.read_overflow_buf[..n_overflow_to_write]);
-                if output_buf.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
                 trace!(
                     "[{}] popped {} bytes from overflow buffer",
                     self.name,
                     n_overflow_to_write
                 );
 
+                // Consume the bytes before any early return. They are already in
+                // the caller's buffer, so leaving them queued serves them a
+                // second time on the next poll.
                 drop_front_items(&mut self.read_overflow_buf, n_overflow_to_write);
+
+                if output_buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
             }
 
             let mut ciphertext = [0u8; CIPHERTEXT_PACKET_SIZE];
@@ -770,6 +774,68 @@ mod tests {
 
             assert_eq!(n, BIG_SIZE);
             assert_eq!(big_buf, [0xFF; BIG_SIZE]);
+        };
+
+        run_client_server_test(server_run, client_run).await;
+    }
+
+    /// Reading in chunks smaller than one Noise packet must not replay bytes.
+    ///
+    /// A decrypted packet that does not fit the caller's buffer is parked in
+    /// `read_overflow_buf`. Serving it back has to consume it, including on the
+    /// path that returns early because the caller's buffer is now full —
+    /// otherwise the next poll hands out the same bytes again.
+    ///
+    /// `send_and_recv_large` cannot catch this: its payload is uniformly 0xFF,
+    /// so a replayed window compares equal. This one is position-dependent.
+    #[tokio::test]
+    async fn recv_in_small_chunks_does_not_duplicate() {
+        const SIZE: usize = 8192;
+        const CHUNK: usize = 100;
+
+        fn payload() -> Vec<u8> {
+            (0..SIZE).map(|i| (i % 251) as u8).collect()
+        }
+
+        let server_run = |mut noise_stream: NoiseTcpStream| async move {
+            let mut go = [0u8; 1];
+            noise_stream
+                .recv(&mut go)
+                .await
+                .expect("server failed to read the go byte");
+            noise_stream
+                .send(&payload())
+                .await
+                .expect("server failed to send the payload");
+        };
+
+        let client_run = |mut noise_stream: NoiseTcpStream| async move {
+            noise_stream
+                .send(b"g")
+                .await
+                .expect("client failed to send the go byte");
+
+            let mut got = Vec::with_capacity(SIZE);
+            let mut buf = [0u8; CHUNK];
+            while got.len() < SIZE {
+                let want = CHUNK.min(SIZE - got.len());
+                let n = noise_stream
+                    .recv(&mut buf[..want])
+                    .await
+                    .expect("client failed to receive a chunk");
+                assert_ne!(n, 0, "unexpected EOF after {} bytes", got.len());
+                got.extend_from_slice(&buf[..n]);
+            }
+
+            assert_eq!(got.len(), SIZE);
+            let want = payload();
+            if let Some(i) = want.iter().zip(got.iter()).position(|(a, b)| a != b) {
+                panic!(
+                    "stream corrupted at byte {i}: expected {:?}, got {:?}",
+                    &want[i..(i + 8).min(want.len())],
+                    &got[i..(i + 8).min(got.len())],
+                );
+            }
         };
 
         run_client_server_test(server_run, client_run).await;
