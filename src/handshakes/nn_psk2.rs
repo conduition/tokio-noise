@@ -9,6 +9,7 @@
 //! The PSK is then mixed into the handshake during the responder's first reply.
 //! That and every successive message is protected by the PSK, but the
 //! initiator's first identity message is not protected or authenticated.
+#![allow(clippy::needless_return_with_question_mark)]
 
 use snow::{
     params::{
@@ -174,9 +175,9 @@ where
         send_buf: &mut [u8],
     ) -> Result<usize, NoiseError> {
         // Assume the initiator sent us their identity
-        let initiator_identity = &recv_buf[..];
+        let initiator_identity = recv_buf;
 
-        if initiator_identity.len() == 0 {
+        if initiator_identity.is_empty() {
             return Err(self.error("initiator did not send us their identity to look up a PSK"))?;
         }
 

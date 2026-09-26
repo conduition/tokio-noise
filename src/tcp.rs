@@ -490,7 +490,7 @@ impl AsyncRead for NoiseTcpStream {
                 return Poll::Ready(Ok(()));
             }
 
-            if self.read_overflow_buf.len() > 0 {
+            if !self.read_overflow_buf.is_empty() {
                 let n_overflow_to_write = self.read_overflow_buf.len().min(output_buf.remaining());
                 output_buf.put_slice(&self.read_overflow_buf[..n_overflow_to_write]);
                 trace!(
@@ -528,7 +528,7 @@ impl AsyncRead for NoiseTcpStream {
             let filled = ciphertext_buf.filled();
 
             // No data left in socket.
-            if filled.len() == 0 {
+            if filled.is_empty() {
                 return Poll::Ready(Ok(()));
             }
 
