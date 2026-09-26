@@ -352,10 +352,7 @@ impl NoiseTcpStream {
     /// a new packet is only encrypted once it is empty, so it cannot grow
     /// unboundedly. Returns `Ready(Ok(()))` once drained, or `Pending`
     /// (surfacing backpressure) while the socket can't take it.
-    fn poll_drain_write_overflow(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_drain_write_overflow(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         while !self.write_overflow_buf.is_empty() {
             match AsyncWrite::poll_write(Pin::new(&mut self.tcp), cx, &self.write_overflow_buf) {
                 Poll::Ready(Ok(0)) => {
