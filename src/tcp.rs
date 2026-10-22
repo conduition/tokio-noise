@@ -1187,7 +1187,7 @@ mod tests {
     /// The same check as above, at every 37th size from 1 byte to 70 KB.
     ///
     /// This opens about 1,900 connections, so it does not run by default.
-    /// Run it with `cargo test -- --ignored`.
+    /// Run it with `cargo test --lib -- --ignored`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn http1_post_bodies_of_sampled_sizes_arrive_in_full() {
